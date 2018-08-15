@@ -41,6 +41,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -80,38 +81,33 @@ public final class FuncallExpression extends Expression {
                 }
               });
 
-  private static final LoadingCache<Class<?>, Map<String, List<MethodDescriptor>>> methodCache =
-      CacheBuilder.newBuilder()
-          .build(
-              new CacheLoader<Class<?>, Map<String, List<MethodDescriptor>>>() {
+  private static final ThreadLocal<IdentityHashMap<Class<?>, Map<String, List<MethodDescriptor>>>> methodCache = ThreadLocal.withInitial(IdentityHashMap::new);
 
-                @Override
-                public Map<String, List<MethodDescriptor>> load(Class<?> key) throws Exception {
-                  Map<String, List<MethodDescriptor>> methodMap = new HashMap<>();
-                  for (Method method : key.getMethods()) {
-                    // Synthetic methods lead to false multiple matches
-                    if (method.isSynthetic()) {
-                      continue;
-                    }
-                    SkylarkCallable callable = SkylarkInterfaceUtils.getSkylarkCallable(method);
-                    if (callable == null) {
-                      continue;
-                    }
-                    if (callable.selfCall()) {
-                      // Self-call java methods are not treated as methods of the skylark value.
-                      continue;
-                    }
-                    String name = callable.name();
-                    if (methodMap.containsKey(name)) {
-                      methodMap.get(name).add(MethodDescriptor.of(method, callable));
-                    } else {
-                      methodMap.put(
-                          name, Lists.newArrayList(MethodDescriptor.of(method, callable)));
-                    }
-                  }
-                  return ImmutableMap.copyOf(methodMap);
-                }
-              });
+  private static Map<String, List<MethodDescriptor>> computeClassMethods(Class<?> key) {
+    Map<String, List<MethodDescriptor>> methodMap = new HashMap<>();
+    for (Method method : key.getMethods()) {
+      // Synthetic methods lead to false multiple matches
+      if (method.isSynthetic()) {
+        continue;
+      }
+      SkylarkCallable callable = SkylarkInterfaceUtils.getSkylarkCallable(method);
+      if (callable == null) {
+        continue;
+      }
+      if (callable.selfCall()) {
+        // Self-call java methods are not treated as methods of the skylark value.
+        continue;
+      }
+      String name = callable.name();
+      if (methodMap.containsKey(name)) {
+        methodMap.get(name).add(MethodDescriptor.of(method, callable));
+      } else {
+        methodMap.put(
+            name, Lists.newArrayList(MethodDescriptor.of(method, callable)));
+      }
+    }
+    return ImmutableMap.copyOf(methodMap);
+  }
 
   private static final LoadingCache<Class<?>, Map<String, MethodDescriptor>> fieldCache =
       CacheBuilder.newBuilder()
@@ -123,8 +119,7 @@ public final class FuncallExpression extends Expression {
                   ImmutableMap.Builder<String, MethodDescriptor> fieldMap = ImmutableMap.builder();
                   HashSet<String> fieldNamesForCollisions = new HashSet<>();
                   List<MethodDescriptor> fieldMethods =
-                      methodCache
-                          .get(key)
+                      getMethods(key)
                           .values()
                           .stream()
                           .flatMap(List::stream)
@@ -305,11 +300,12 @@ public final class FuncallExpression extends Expression {
 
   /** Returns the list of Skylark callable Methods of objClass with the given name. */
   public static List<MethodDescriptor> getMethods(Class<?> objClass, String methodName) {
-    try {
-      return methodCache.get(getClassOrProxyClass(objClass)).get(methodName);
-    } catch (ExecutionException e) {
-      throw new IllegalStateException("Method loading failed: " + e);
-    }
+    return getMethods(objClass).get(methodName);
+  }
+
+  /** @return the map of method names to corresponding method descriptors of the {@code objClass}. */
+  private static Map<String, List<MethodDescriptor>> getMethods(Class<?> objClass) {
+    return methodCache.get().computeIfAbsent(getClassOrProxyClass(objClass), FuncallExpression::computeClassMethods);
   }
 
   /**
@@ -317,11 +313,7 @@ public final class FuncallExpression extends Expression {
    * objClass}.
    */
   public static Set<String> getMethodNames(Class<?> objClass) {
-    try {
-      return methodCache.get(getClassOrProxyClass(objClass)).keySet();
-    } catch (ExecutionException e) {
-      throw new IllegalStateException("Method loading failed: " + e);
-    }
+    return getMethods(objClass).keySet();
   }
 
   /**
