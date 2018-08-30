@@ -49,8 +49,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 /** Syntax node for a function call expression. */
 public final class FuncallExpression extends Expression {
@@ -81,7 +84,12 @@ public final class FuncallExpression extends Expression {
                 }
               });
 
-  private static final ThreadLocal<IdentityHashMap<Class<?>, Map<String, List<MethodDescriptor>>>> methodCache = ThreadLocal.withInitial(IdentityHashMap::new);
+  private static final ReadWriteLock methodCacheLock = new ReentrantReadWriteLock();
+  // since most of operation on methodCache will be reads, instead of using complex data structures
+  // like LoadingCache or ConcurrentHashMap, a simple IdentityHashMap can be used - it uses open
+  // addressing for conflict resolution and as such offers the best lookup performance.
+  @GuardedBy("methodCacheLock")
+  private static final Map<Class<?>, Map<String, List<MethodDescriptor>>> methodCache = new IdentityHashMap<>();
 
   private static Map<String, List<MethodDescriptor>> computeClassMethods(Class<?> key) {
     Map<String, List<MethodDescriptor>> methodMap = new HashMap<>();
@@ -305,7 +313,21 @@ public final class FuncallExpression extends Expression {
 
   /** @return the map of method names to corresponding method descriptors of the {@code objClass}. */
   private static Map<String, List<MethodDescriptor>> getMethods(Class<?> objClass) {
-    return methodCache.get().computeIfAbsent(getClassOrProxyClass(objClass), FuncallExpression::computeClassMethods);
+    methodCacheLock.readLock().lock();
+    try {
+      @Nullable Map<String, List<MethodDescriptor>> methods = methodCache.get(objClass);
+      if (methods != null) {
+        return methods;
+      }
+    } finally {
+      methodCacheLock.readLock().unlock();
+    }
+    methodCacheLock.writeLock().lock();
+    try {
+      return methodCache.computeIfAbsent(getClassOrProxyClass(objClass), FuncallExpression::computeClassMethods);
+    } finally {
+      methodCacheLock.writeLock().unlock();
+    }
   }
 
   /**
